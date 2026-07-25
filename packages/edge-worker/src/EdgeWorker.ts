@@ -149,7 +149,7 @@ import { ChatSessionHandler } from "./ChatSessionHandler.js";
 import { ConfigManager, type RepositoryChanges } from "./ConfigManager.js";
 import { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 import { EgressProxy } from "./EgressProxy.js";
-import { GitService } from "./GitService.js";
+import { GitService, WorktreeFreshnessError } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
 import { McpConfigService } from "./McpConfigService.js";
 import { PromptBuilder } from "./PromptBuilder.js";
@@ -3218,6 +3218,26 @@ ${taskSection}`;
 				`Failed to process webhook: ${(webhook as any).action}`,
 				error,
 			);
+			if (
+				error instanceof WorktreeFreshnessError &&
+				(isAgentSessionCreatedWebhook(webhook) ||
+					isAgentSessionPromptedWebhook(webhook))
+			) {
+				const issueTracker = this.issueTrackers.get(webhook.organizationId);
+				if (issueTracker) {
+					await this.postActivityDirect(
+						issueTracker,
+						{
+							agentSessionId: webhook.agentSession.id,
+							content: {
+								type: "response",
+								body: `**Workspace requires manual intervention**\n\n${error.message}\n\nNo runner was started. Resume the existing worktree manually, rebase it, or relaunch the task from a fresh worktree.`,
+							},
+						},
+						"worktree freshness failure",
+					);
+				}
+			}
 			// Don't re-throw webhook processing errors to prevent application crashes
 			// The error has been logged and individual webhook failures shouldn't crash the entire system
 		} finally {

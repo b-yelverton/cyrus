@@ -420,37 +420,66 @@ export class GitService {
 		hasRemote: boolean,
 	): Workspace {
 		const remoteBase = `origin/${resolution.branch}`;
+		const baseCandidates = hasRemote
+			? [
+					remoteBase,
+					...(resolution.source === "default" ? [] : [resolution.branch]),
+				]
+			: [];
 
-		if (!hasRemote) {
+		if (baseCandidates.length === 0) {
 			throw new WorktreeFreshnessError(
 				`Cannot reuse worktree at ${workspacePath}: origin could not be refreshed before checking ${remoteBase}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
 			);
 		}
 
-		let remoteBaseSha: string;
+		let baseRef: string | undefined;
+		let baseSha: string | undefined;
+		for (const candidate of baseCandidates) {
+			try {
+				const candidateSha = String(
+					execSync(`git rev-parse --verify "${candidate}"`, {
+						cwd: repository.repositoryPath,
+						encoding: "utf-8",
+					}),
+				).trim();
+				if (candidateSha) {
+					baseRef = candidate;
+					baseSha = candidateSha;
+					break;
+				}
+			} catch {
+				// Non-default bases may be local commit-ish values (including
+				// Graphite/parent branches), so try the next supported form.
+			}
+		}
+
+		if (!baseRef || !baseSha) {
+			throw new WorktreeFreshnessError(
+				`Cannot verify freshness for worktree at ${workspacePath}: none of the requested base refs (${baseCandidates.join(", ")}) resolved to a commit. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+			);
+		}
+
 		let worktreeHeadSha: string;
 		try {
-			remoteBaseSha = String(
-				execSync(`git rev-parse --verify "${remoteBase}"`, {
-					cwd: repository.repositoryPath,
-					encoding: "utf-8",
-				}),
-			).trim();
 			worktreeHeadSha = String(
 				execSync("git rev-parse --verify HEAD", {
 					cwd: workspacePath,
 					encoding: "utf-8",
 				}),
 			).trim();
+			if (!worktreeHeadSha) {
+				throw new Error("git rev-parse returned an empty HEAD SHA");
+			}
 		} catch (error) {
 			throw new WorktreeFreshnessError(
-				`Cannot verify freshness for worktree at ${workspacePath} against ${remoteBase}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+				`Cannot verify freshness for worktree at ${workspacePath} against ${baseRef}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
 			);
 		}
 
-		if (worktreeHeadSha === remoteBaseSha) {
+		if (worktreeHeadSha === baseSha) {
 			this.logger.info(
-				`Worktree already exists at ${workspacePath} and matches ${remoteBase}, using existing`,
+				`Worktree already exists at ${workspacePath} and matches ${baseRef}, using existing`,
 			);
 			return {
 				path: workspacePath,
@@ -466,20 +495,23 @@ export class GitService {
 		let commonAncestorSha: string;
 		try {
 			commonAncestorSha = String(
-				execSync(`git merge-base "${remoteBase}" HEAD`, {
+				execSync(`git merge-base "${baseRef}" HEAD`, {
 					cwd: workspacePath,
 					encoding: "utf-8",
 				}),
 			).trim();
+			if (!commonAncestorSha) {
+				throw new Error("git merge-base returned an empty SHA");
+			}
 		} catch (error) {
 			throw new WorktreeFreshnessError(
-				`Cannot determine whether worktree at ${workspacePath} includes ${remoteBase}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+				`Cannot determine whether worktree at ${workspacePath} includes ${baseRef}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
 			);
 		}
 
-		if (commonAncestorSha === remoteBaseSha) {
+		if (commonAncestorSha === baseSha) {
 			this.logger.info(
-				`Worktree already exists at ${workspacePath} and includes ${remoteBase}, using existing`,
+				`Worktree already exists at ${workspacePath} and includes ${baseRef}, using existing`,
 			);
 			return {
 				path: workspacePath,
@@ -499,7 +531,7 @@ export class GitService {
 					}),
 				).trim().length > 0;
 			taskCommitCount = Number.parseInt(
-				execSync(`git rev-list --count "${remoteBase}..HEAD"`, {
+				execSync(`git rev-list --count "${baseRef}..HEAD"`, {
 					cwd: workspacePath,
 					encoding: "utf-8",
 				})
@@ -520,27 +552,27 @@ export class GitService {
 
 		if (dirty) {
 			throw new WorktreeFreshnessError(
-				`Worktree at ${workspacePath} has uncommitted changes and is behind ${remoteBase}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+				`Worktree at ${workspacePath} has uncommitted changes and is behind ${baseRef}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
 			);
 		}
 
 		if (taskCommitCount > 0) {
 			throw new WorktreeFreshnessError(
-				`Worktree at ${workspacePath} has ${taskCommitCount} task commit(s) on a stale base behind ${remoteBase}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+				`Worktree at ${workspacePath} has ${taskCommitCount} task commit(s) on a stale base behind ${baseRef}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
 			);
 		}
 
 		this.logger.info(
-			`Resetting clean worktree at ${workspacePath} with no task commits to ${remoteBase}`,
+			`Resetting clean worktree at ${workspacePath} with no task commits to ${baseRef}`,
 		);
 		try {
-			execSync(`git reset --hard "${remoteBase}"`, {
+			execSync(`git reset --hard "${baseRef}"`, {
 				cwd: workspacePath,
 				stdio: "pipe",
 			});
 		} catch (error) {
 			throw new WorktreeFreshnessError(
-				`Unable to reset clean stale worktree at ${workspacePath} to ${remoteBase}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not delete this worktree automatically.`,
+				`Unable to reset clean stale worktree at ${workspacePath} to ${baseRef}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not delete this worktree automatically.`,
 			);
 		}
 

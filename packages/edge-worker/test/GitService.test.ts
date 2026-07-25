@@ -418,6 +418,13 @@ describe("GitService", () => {
 					// Branch exists
 					return Buffer.from("abc123\n");
 				}
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "base-sha\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") {
+					return "base-sha\n";
+				}
 				return Buffer.from("");
 			});
 
@@ -458,6 +465,12 @@ describe("GitService", () => {
 					throw new Error(
 						"fatal: 'cyrustester/eng-97-fix-shader' is already used by worktree at '/home/user/.cyrus/worktrees/LINEAR-SESSION'",
 					);
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "base-sha\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") {
+					return "base-sha\n";
 				}
 				return Buffer.from("");
 			});
@@ -841,6 +854,9 @@ describe("GitService", () => {
 					return "newbase\n";
 				}
 				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === 'git merge-base "origin/main" HEAD') {
+					return "oldbase\n";
+				}
 				if (cmdStr === "git status --porcelain") return "";
 				if (cmdStr === 'git rev-list --count "origin/main..HEAD"') {
 					return "0\n";
@@ -909,6 +925,126 @@ describe("GitService", () => {
 			expect(commands).not.toContain('git reset --hard "origin/main"');
 		});
 
+		it("reuses an existing worktree from a local commit-ish override", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			const commitSha = "0123456789abcdef0123456789abcdef01234567";
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === `git rev-parse --verify "origin/${commitSha}"`) {
+					throw new Error("not a remote-tracking branch");
+				}
+				if (cmdStr === `git rev-parse --verify "${commitSha}"`) {
+					return "commit-sha\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "commit-sha\n";
+				return Buffer.from("");
+			});
+
+			const result = await gitService.createGitWorktree(issue, [repository], {
+				baseBranchOverrides: new Map([[repository.id, commitSha]]),
+			});
+
+			expect(result).toMatchObject({
+				path: "/home/user/.cyrus/worktrees/ENG-97",
+				isGitWorktree: true,
+			});
+			expect(result.resolvedBaseBranches?.[repository.id]).toMatchObject({
+				branch: commitSha,
+				source: "commit-ish",
+			});
+		});
+
+		it("reuses an existing worktree from a local parent branch", async () => {
+			const parentBranch = "cyrustester/eng-96-parent";
+			const issue = makeIssue({
+				parent: Promise.resolve({
+					identifier: "ENG-96",
+					title: "Parent issue",
+					branchName: parentBranch,
+				}),
+			});
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === `git rev-parse --verify "origin/${parentBranch}"`) {
+					throw new Error("not a remote-tracking branch");
+				}
+				if (cmdStr === `git rev-parse --verify "${parentBranch}"`) {
+					return "parent-sha\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "parent-sha\n";
+				return Buffer.from("");
+			});
+
+			const result = await gitService.createGitWorktree(issue, [repository]);
+
+			expect(result.resolvedBaseBranches?.[repository.id]).toMatchObject({
+				branch: parentBranch,
+				source: "parent-issue",
+			});
+		});
+
+		it("reuses an existing worktree from a local Graphite base branch", async () => {
+			const graphiteBranch = "cyrustester/eng-95-blocking";
+			const issue = makeIssue({
+				labels: () => Promise.resolve({ nodes: [{ name: "graphite" }] }),
+				inverseRelations: () =>
+					Promise.resolve({
+						nodes: [
+							{
+								type: "blocks",
+								issue: Promise.resolve({
+									identifier: "ENG-95",
+									title: "Blocking issue",
+									branchName: graphiteBranch,
+								}),
+							},
+						],
+					}),
+			});
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === `git rev-parse --verify "origin/${graphiteBranch}"`) {
+					throw new Error("not a remote-tracking branch");
+				}
+				if (cmdStr === `git rev-parse --verify "${graphiteBranch}"`) {
+					return "graphite-sha\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "graphite-sha\n";
+				return Buffer.from("");
+			});
+
+			const result = await gitService.createGitWorktree(issue, [repository]);
+
+			expect(result.resolvedBaseBranches?.[repository.id]).toMatchObject({
+				branch: graphiteBranch,
+				source: "graphite-blocked-by",
+			});
+		});
+
 		it("refuses a dirty stale worktree without resetting, stashing, rebasing, or deleting it", async () => {
 			const issue = makeIssue();
 			const repository = makeRepository();
@@ -925,6 +1061,9 @@ describe("GitService", () => {
 					return "newbase\n";
 				}
 				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === 'git merge-base "origin/main" HEAD') {
+					return "oldbase\n";
+				}
 				if (cmdStr === "git status --porcelain") return " M package.json\n";
 				if (cmdStr === 'git rev-list --count "origin/main..HEAD"') {
 					return "0\n";
@@ -962,6 +1101,9 @@ describe("GitService", () => {
 					return "newbase\n";
 				}
 				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === 'git merge-base "origin/main" HEAD') {
+					return "oldbase\n";
+				}
 				if (cmdStr === "git status --porcelain") return "";
 				if (cmdStr === 'git rev-list --count "origin/main..HEAD"') {
 					return "2\n";
@@ -1807,6 +1949,74 @@ describe("GitService", () => {
 	});
 
 	describe("createGitWorktree - N repos (multi-repo)", () => {
+		it("refuses the whole workspace when a reused repository worktree is unsafe", async () => {
+			const issue = makeIssue();
+			const repo1 = makeRepository({
+				id: "repo-1",
+				name: "cyrus",
+				repositoryPath: "/home/user/cyrus",
+			});
+			const repo2 = makeRepository({
+				id: "repo-2",
+				name: "cyrus-hosted",
+				repositoryPath: "/home/user/cyrus-hosted",
+			});
+			const unsafePath = "/home/user/.cyrus/worktrees/ENG-97/cyrus";
+			const existingRepo1Worktree = [
+				"worktree /home/user/cyrus",
+				"HEAD base",
+				"branch refs/heads/main",
+				"",
+				`worktree ${unsafePath}`,
+				"HEAD oldbase",
+				"branch refs/heads/cyrustester/eng-97-fix-shader",
+				"",
+			].join("\n");
+
+			mockExistsSync.mockImplementation(
+				(path: any) => String(path) === `${unsafePath}/.git`,
+			);
+			mockStatSync.mockReturnValue({ isFile: () => true } as any);
+			mockExecSync.mockImplementation((cmd: any, options: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingRepo1Worktree;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "newbase\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === 'git merge-base "origin/main" HEAD') {
+					return "oldbase\n";
+				}
+				if (cmdStr === "git status --porcelain") return " M package.json\n";
+				if (cmdStr === 'git rev-list --count "origin/main..HEAD"') {
+					return "0\n";
+				}
+				throw new Error(`Unexpected git command in ${options?.cwd}: ${cmdStr}`);
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repo1, repo2]),
+			).rejects.toThrow(/Manual resume, rebase, or relaunch is required/);
+
+			const calls = mockExecSync.mock.calls.map(([command, options]) => ({
+				command: String(command),
+				cwd: options?.cwd,
+			}));
+			expect(calls.some(({ cwd }) => cwd === repo2.repositoryPath)).toBe(false);
+			expect(
+				calls.some(({ command }) =>
+					/git (reset|stash|rebase|worktree remove)/.test(command),
+				),
+			).toBe(false);
+			expect(mockMkdirSync).not.toHaveBeenCalledWith(unsafePath, {
+				recursive: true,
+			});
+		});
+
 		it("creates parent folder with per-repo worktree subdirectories", async () => {
 			const issue = makeIssue();
 			const repo1 = makeRepository({

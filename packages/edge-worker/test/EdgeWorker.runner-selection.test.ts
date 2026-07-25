@@ -13,6 +13,7 @@ import { LinearEventTransport } from "cyrus-linear-event-transport";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager.js";
 import { EdgeWorker } from "../src/EdgeWorker.js";
+import { WorktreeFreshnessError } from "../src/GitService.js";
 import { SharedApplicationServer } from "../src/SharedApplicationServer.js";
 import type { EdgeWorkerConfig, RepositoryConfig } from "../src/types.js";
 import { TEST_CYRUS_HOME } from "./test-dirs.js";
@@ -59,6 +60,7 @@ describe("EdgeWorker - Runner Selection Based on Labels", () => {
 	let mockCursorRunner: any;
 	let mockGeminiRunner: any;
 	let mockAgentSessionManager: any;
+	let mockIssueTracker: any;
 	let capturedRunnerType: RunnerType | null = null;
 	let capturedRunnerConfig: any = null;
 
@@ -263,12 +265,25 @@ Issue: {{issue_identifier}}`;
 		edgeWorker = new EdgeWorker(mockConfig);
 
 		// Inject mock issue tracker
-		const mockIssueTracker = {
+		mockIssueTracker = {
 			fetchIssue: vi.fn().mockImplementation(async (issueId: string) => {
 				return mockLinearClient.issue(issueId);
 			}),
 			getIssueLabels: vi.fn(),
 			getClient: vi.fn().mockReturnValue({}),
+			fetchWorkflowStates: vi.fn().mockResolvedValue({
+				nodes: [
+					{ id: "state-1", name: "Todo", type: "unstarted", position: 0 },
+					{
+						id: "state-2",
+						name: "In Progress",
+						type: "started",
+						position: 1,
+					},
+				],
+			}),
+			updateIssue: vi.fn().mockResolvedValue({ success: true }),
+			createAgentActivity: vi.fn().mockResolvedValue({ success: true }),
 		};
 		(edgeWorker as any).issueTrackers.set(
 			mockRepository.linearWorkspaceId,
@@ -1142,6 +1157,64 @@ Issue: {{issue_identifier}}`;
 				"cursor-session-existing",
 			);
 			expect(mockCursorRunner.start).toHaveBeenCalledOnce();
+		});
+	});
+
+	describe("Worktree freshness failure", () => {
+		it("posts a terminal UI response and does not start a runner", async () => {
+			const mockIssue = createMockIssueWithLabels([]);
+			mockLinearClient.issue.mockResolvedValue(mockIssue);
+			vi.spyOn(
+				(edgeWorker as any).repositoryRouter,
+				"determineRepositoryForWebhook",
+			).mockResolvedValue({
+				type: "selected",
+				repositories: [mockRepository],
+				routingMethod: "team-based",
+			});
+			vi.mocked(mockConfig.handlers!.createWorkspace!).mockRejectedValue(
+				new WorktreeFreshnessError(
+					"Worktree has uncommitted changes. Manual resume, rebase, or relaunch is required.",
+				),
+			);
+			const onSessionStart = vi.fn();
+			mockConfig.handlers!.onSessionStart = onSessionStart;
+			const webhook: LinearAgentSessionCreatedWebhook = {
+				type: "Issue",
+				action: "agentSessionCreated",
+				organizationId: "test-workspace",
+				agentSession: {
+					id: "agent-session-123",
+					issue: {
+						id: "issue-123",
+						identifier: "TEST-123",
+						team: { key: "TEST" },
+					},
+				},
+			};
+
+			await (edgeWorker as any).handleWebhook(webhook, [mockRepository]);
+
+			expect(mockIssueTracker.updateIssue).toHaveBeenCalledWith("issue-123", {
+				stateId: "state-2",
+			});
+			expect(mockIssueTracker.createAgentActivity).toHaveBeenCalledWith({
+				agentSessionId: "agent-session-123",
+				content: {
+					type: "response",
+					body: expect.stringMatching(
+						/No runner was started.*resume.*rebase.*relaunch/is,
+					),
+				},
+			});
+			expect(
+				mockAgentSessionManager.createCyrusAgentSession,
+			).not.toHaveBeenCalled();
+			expect(ClaudeRunner).not.toHaveBeenCalled();
+			expect(CodexRunner).not.toHaveBeenCalled();
+			expect(CursorRunner).not.toHaveBeenCalled();
+			expect(GeminiRunner).not.toHaveBeenCalled();
+			expect(onSessionStart).not.toHaveBeenCalled();
 		});
 	});
 });
