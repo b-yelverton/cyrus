@@ -3223,20 +3223,11 @@ ${taskSection}`;
 				(isAgentSessionCreatedWebhook(webhook) ||
 					isAgentSessionPromptedWebhook(webhook))
 			) {
-				const issueTracker = this.issueTrackers.get(webhook.organizationId);
-				if (issueTracker) {
-					await this.postActivityDirect(
-						issueTracker,
-						{
-							agentSessionId: webhook.agentSession.id,
-							content: {
-								type: "response",
-								body: `**Workspace requires manual intervention**\n\n${error.message}\n\nNo runner was started. Resume the existing worktree manually, rebase it, or relaunch the task from a fresh worktree.`,
-							},
-						},
-						"worktree freshness failure",
-					);
-				}
+				await this.postWorktreeFreshnessError(
+					webhook.agentSession.id,
+					webhook.organizationId,
+					error,
+				);
 			}
 			// Don't re-throw webhook processing errors to prevent application crashes
 			// The error has been logged and individual webhook failures shouldn't crash the entire system
@@ -3940,6 +3931,13 @@ ${taskSection}`;
 					`Failed to wake parked session for issue ${blockedIssueId}:`,
 					error,
 				);
+				if (error instanceof WorktreeFreshnessError) {
+					await this.postWorktreeFreshnessError(
+						parked.agentSession.id,
+						parked.linearWorkspaceId,
+						error,
+					);
+				}
 			}
 		}
 	}
@@ -4004,7 +4002,40 @@ ${taskSection}`;
 				`Failed to wake parked session for issue ${issueId} on re-prompt:`,
 				error,
 			);
+			if (error instanceof WorktreeFreshnessError) {
+				await this.postWorktreeFreshnessError(
+					parked.agentSession.id,
+					parked.linearWorkspaceId,
+					error,
+				);
+			}
 		}
+	}
+
+	private async postWorktreeFreshnessError(
+		agentSessionId: string,
+		linearWorkspaceId: string,
+		error: WorktreeFreshnessError,
+	): Promise<void> {
+		const issueTracker = this.issueTrackers.get(linearWorkspaceId);
+		if (!issueTracker) {
+			this.logger.warn(
+				`No issue tracker found for workspace ${linearWorkspaceId}; unable to post worktree freshness failure`,
+			);
+			return;
+		}
+
+		await this.postActivityDirect(
+			issueTracker,
+			{
+				agentSessionId,
+				content: {
+					type: "error",
+					body: `**Workspace requires manual intervention**\n\n${error.message}\n\nNo runner was started. Resume the existing worktree manually, rebase it, or relaunch the task from a fresh worktree.`,
+				},
+			},
+			"worktree freshness failure",
+		);
 	}
 
 	private buildIssueUpdatePrompt(

@@ -1161,7 +1161,7 @@ Issue: {{issue_identifier}}`;
 	});
 
 	describe("Worktree freshness failure", () => {
-		it("posts a terminal UI response and does not start a runner", async () => {
+		it("posts a terminal UI error and does not start a runner", async () => {
 			const mockIssue = createMockIssueWithLabels([]);
 			mockLinearClient.issue.mockResolvedValue(mockIssue);
 			vi.spyOn(
@@ -1201,7 +1201,7 @@ Issue: {{issue_identifier}}`;
 			expect(mockIssueTracker.createAgentActivity).toHaveBeenCalledWith({
 				agentSessionId: "agent-session-123",
 				content: {
-					type: "response",
+					type: "error",
 					body: expect.stringMatching(
 						/No runner was started.*resume.*rebase.*relaunch/is,
 					),
@@ -1215,6 +1215,78 @@ Issue: {{issue_identifier}}`;
 			expect(CursorRunner).not.toHaveBeenCalled();
 			expect(GeminiRunner).not.toHaveBeenCalled();
 			expect(onSessionStart).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			["dependency completion", "handleIssueStateChange"],
+			["parked re-prompt", "handleParkedSessionReprompt"],
+		] as const)("posts the same terminal UI error when parked wake fails after %s", async (_label, wakeMethod) => {
+			const freshnessError = new WorktreeFreshnessError(
+				"Worktree is unsafe. Manual resume, rebase, or relaunch is required.",
+			);
+			const initializeAgentRunner = vi
+				.spyOn(edgeWorker as any, "initializeAgentRunner")
+				.mockRejectedValue(freshnessError);
+			const agentSession = {
+				id: "parked-agent-session",
+				issue: {
+					id: "parked-issue",
+					identifier: "TEST-456",
+					team: { key: "TEST" },
+				},
+			};
+			(edgeWorker as any).parkedSessions.set("parked-issue", {
+				agentSession,
+				repositories: [mockRepository],
+				linearWorkspaceId: "test-workspace",
+				guidance: undefined,
+				commentBody: null,
+				baseBranchOverrides: undefined,
+				routingMethod: "team-based",
+				blockingIssueIds: ["blocker-issue"],
+			});
+
+			if (wakeMethod === "handleIssueStateChange") {
+				mockIssueTracker.fetchIssue.mockResolvedValue({
+					state: Promise.resolve({ type: "completed" }),
+				});
+				await (edgeWorker as any).handleIssueStateChange({
+					organizationId: "test-workspace",
+					data: {
+						id: "blocker-issue",
+						identifier: "TEST-455",
+						stateId: "completed-state",
+					},
+				});
+			} else {
+				vi.spyOn(
+					edgeWorker as any,
+					"checkBlockedByDependencies",
+				).mockResolvedValue({
+					blocked: false,
+					blockingIssueIds: [],
+					blockingIdentifiers: [],
+				});
+				await (edgeWorker as any).handleParkedSessionReprompt(
+					{},
+					"parked-issue",
+				);
+			}
+
+			expect(initializeAgentRunner).toHaveBeenCalledOnce();
+			expect(mockIssueTracker.createAgentActivity).toHaveBeenCalledWith({
+				agentSessionId: "parked-agent-session",
+				content: {
+					type: "error",
+					body: expect.stringMatching(
+						/No runner was started.*resume.*rebase.*relaunch/is,
+					),
+				},
+			});
+			expect(ClaudeRunner).not.toHaveBeenCalled();
+			expect(CodexRunner).not.toHaveBeenCalled();
+			expect(CursorRunner).not.toHaveBeenCalled();
+			expect(GeminiRunner).not.toHaveBeenCalled();
 		});
 	});
 });

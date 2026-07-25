@@ -17,7 +17,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 vi.mock("node:fs", () => ({
-	existsSync: vi.fn(() => true),
+	existsSync: vi.fn(() => false),
 	mkdirSync: vi.fn(),
 	readFileSync: vi.fn(() => ""),
 	readdirSync: vi.fn(() => []),
@@ -389,6 +389,10 @@ describe("GitService", () => {
 		it("reuses existing worktree when branch is already checked out at a different path", async () => {
 			const issue = makeIssue();
 			const repository = makeRepository();
+			mockExistsSync.mockImplementation(
+				(path: any) =>
+					String(path) === "/home/user/.cyrus/worktrees/LINEAR-SESSION/.git",
+			);
 
 			let callCount = 0;
 			mockExecSync.mockImplementation((cmd: any) => {
@@ -925,6 +929,40 @@ describe("GitService", () => {
 			expect(commands).not.toContain('git reset --hard "origin/main"');
 		});
 
+		it("reuses an existing worktree from a locally-only default base", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					throw new Error("remote default does not exist");
+				}
+				if (cmdStr === 'git rev-parse --verify "main"') {
+					return "local-base\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "local-base\n";
+				return Buffer.from("");
+			});
+
+			const result = await gitService.createGitWorktree(issue, [repository]);
+
+			expect(result).toMatchObject({
+				path: "/home/user/.cyrus/worktrees/ENG-97",
+				isGitWorktree: true,
+			});
+			expect(mockExecSync).toHaveBeenCalledWith(
+				'git rev-parse --verify "main"',
+				expect.objectContaining({ cwd: repository.repositoryPath }),
+			);
+		});
+
 		it("reuses an existing worktree from a local commit-ish override", async () => {
 			const issue = makeIssue();
 			const repository = makeRepository();
@@ -1127,6 +1165,128 @@ describe("GitService", () => {
 			).toBe(false);
 		});
 
+		it("refuses reuse when remote and local base candidates return empty SHAs", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (
+					cmdStr === 'git rev-parse --verify "origin/main"' ||
+					cmdStr === 'git rev-parse --verify "main"'
+				) {
+					return "\n";
+				}
+				throw new Error(`Unexpected command: ${cmdStr}`);
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(/none of the requested base refs.*Manual resume/is);
+			expect(mockExecSync).not.toHaveBeenCalledWith(
+				"git rev-parse --verify HEAD",
+				expect.anything(),
+			);
+		});
+
+		it("refuses reuse when HEAD resolves to an empty SHA", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "base\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "\n";
+				throw new Error(`Unexpected command: ${cmdStr}`);
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(/empty HEAD SHA.*Manual resume/is);
+			expect(mockExecSync).not.toHaveBeenCalledWith(
+				expect.stringContaining("git reset --hard"),
+				expect.anything(),
+			);
+		});
+
+		it("refuses reuse when merge-base resolves to an empty SHA", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "newbase\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === 'git merge-base "origin/main" HEAD') return "\n";
+				throw new Error(`Unexpected command: ${cmdStr}`);
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(/merge-base returned an empty SHA.*Manual resume/is);
+			expect(mockExecSync).not.toHaveBeenCalledWith(
+				expect.stringContaining("git reset --hard"),
+				expect.anything(),
+			);
+		});
+
+		it("refuses reuse when task commit count is non-numeric", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "newbase\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === 'git merge-base "origin/main" HEAD') {
+					return "oldbase\n";
+				}
+				if (cmdStr === "git status --porcelain") return "";
+				if (cmdStr === 'git rev-list --count "origin/main..HEAD"') {
+					return "not-a-number\n";
+				}
+				throw new Error(`Unexpected command: ${cmdStr}`);
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(/non-numeric task commit count.*Manual resume/is);
+			expect(mockExecSync).not.toHaveBeenCalledWith(
+				expect.stringContaining("git reset --hard"),
+				expect.anything(),
+			);
+		});
+
 		it("prunes and recreates worktree when git lists it but directory has no .git file", async () => {
 			const issue = makeIssue();
 			const repository = makeRepository();
@@ -1162,12 +1322,8 @@ describe("GitService", () => {
 				return Buffer.from("");
 			});
 
-			// The workspace path exists but does NOT have a valid .git file (stale)
-			mockExistsSync.mockImplementation((path: any) => {
-				const p = String(path);
-				if (p === "/home/user/.cyrus/worktrees/ENG-97/.git") return false;
-				return true;
-			});
+			// The stale registration points to a directory that no longer exists.
+			mockExistsSync.mockReturnValue(false);
 
 			const result = await gitService.createGitWorktree(issue, [repository]);
 
@@ -1181,6 +1337,92 @@ describe("GitService", () => {
 				cwd: "/home/user/repo",
 				stdio: "pipe",
 			});
+		});
+
+		it("refuses a listed workspace path that exists but is not a usable worktree", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			const workspacePath = "/home/user/.cyrus/worktrees/ENG-97";
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				throw new Error(`Unexpected command: ${cmdStr}`);
+			});
+			mockExistsSync.mockImplementation((path: any) => {
+				const value = String(path);
+				return value === workspacePath;
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(
+				/exists but is not a usable Git worktree.*Manual resume/is,
+			);
+			expect(mockExecSync).not.toHaveBeenCalledWith(
+				"git worktree prune",
+				expect.anything(),
+			);
+			expect(mockMkdirSync).not.toHaveBeenCalledWith(workspacePath, {
+				recursive: true,
+			});
+		});
+
+		it("refuses an existing workspace path that is not listed as a worktree", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			const workspacePath = "/home/user/.cyrus/worktrees/ENG-97";
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return "worktree /home/user/repo\nHEAD abc123\nbranch refs/heads/main\n";
+				}
+				throw new Error(`Unexpected command: ${cmdStr}`);
+			});
+			mockExistsSync.mockImplementation(
+				(path: any) => String(path) === workspacePath,
+			);
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(
+				/already exists but is not registered.*Manual resume/is,
+			);
+			expect(mockMkdirSync).not.toHaveBeenCalledWith(workspacePath, {
+				recursive: true,
+			});
+		});
+
+		it("refuses reuse when git worktree inspection fails", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					throw new Error("worktree metadata unavailable");
+				}
+				throw new Error(`Unexpected command: ${cmdStr}`);
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(
+				/Cannot inspect Git worktrees.*worktree metadata unavailable.*Manual resume/is,
+			);
+			expect(mockMkdirSync).not.toHaveBeenCalledWith(
+				"/home/user/.cyrus/worktrees/ENG-97",
+				{ recursive: true },
+			);
 		});
 
 		it("does not match substring paths in worktree list", async () => {

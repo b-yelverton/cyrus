@@ -421,10 +421,7 @@ export class GitService {
 	): Workspace {
 		const remoteBase = `origin/${resolution.branch}`;
 		const baseCandidates = hasRemote
-			? [
-					remoteBase,
-					...(resolution.source === "default" ? [] : [resolution.branch]),
-				]
+			? [...new Set([remoteBase, resolution.branch])]
 			: [];
 
 		if (baseCandidates.length === 0) {
@@ -530,20 +527,21 @@ export class GitService {
 						encoding: "utf-8",
 					}),
 				).trim().length > 0;
-			taskCommitCount = Number.parseInt(
-				execSync(`git rev-list --count "${baseRef}..HEAD"`, {
+			const taskCommitCountOutput = execSync(
+				`git rev-list --count "${baseRef}..HEAD"`,
+				{
 					cwd: workspacePath,
 					encoding: "utf-8",
-				})
-					.toString()
-					.trim(),
-				10,
-			);
-			if (Number.isNaN(taskCommitCount)) {
+				},
+			)
+				.toString()
+				.trim();
+			if (!/^\d+$/.test(taskCommitCountOutput)) {
 				throw new Error(
 					"git rev-list returned a non-numeric task commit count",
 				);
 			}
+			taskCommitCount = Number.parseInt(taskCommitCountOutput, 10);
 		} catch (error) {
 			throw new WorktreeFreshnessError(
 				`Cannot determine whether stale worktree at ${workspacePath} is safe to reset: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
@@ -976,7 +974,10 @@ export class GitService {
 			// remote base instead of a stale local remote-tracking ref.
 			hasRemote = this.refreshOrigin(repository.repositoryPath);
 
-			// Check if worktree already exists
+			// Check if worktree already exists. This inspection is a safety gate:
+			// if it fails, Cyrus cannot prove that creating or reusing the expected
+			// path is safe.
+			let worktreeLines: string[];
 			try {
 				const worktrees = execSync("git worktree list --porcelain", {
 					cwd: repository.repositoryPath,
@@ -985,7 +986,7 @@ export class GitService {
 
 				// Use exact line match to avoid substring false positives
 				// (e.g., "/path/CYSV-56" matching "/path/CYSV-56/cyrus")
-				const worktreeLines = worktrees
+				worktreeLines = worktrees
 					.split("\n")
 					.filter((line) => line.startsWith("worktree "))
 					.map((line) => line.substring("worktree ".length));
@@ -1001,7 +1002,15 @@ export class GitService {
 							hasRemote,
 						);
 					}
-					// Stale worktree entry — prune and continue with creation
+					if (existsSync(workspacePath)) {
+						throw new WorktreeFreshnessError(
+							`Cannot reuse expected worktree at ${workspacePath}: the path exists but is not a usable Git worktree. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, delete, or replace this directory automatically.`,
+						);
+					}
+
+					// Stale worktree entry with no directory — prune and continue
+					// with creation. Failure to prune is unsafe because Git may still
+					// consider the task branch checked out there.
 					this.logger.info(
 						`Stale worktree entry found for ${workspacePath}, pruning and recreating`,
 					);
@@ -1010,15 +1019,28 @@ export class GitService {
 							cwd: repository.repositoryPath,
 							stdio: "pipe",
 						});
-					} catch {
-						// Prune failed, continue anyway
+					} catch (error) {
+						throw new WorktreeFreshnessError(
+							`Cannot safely recreate worktree at ${workspacePath}: git worktree prune failed: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, delete, or replace this workspace automatically.`,
+						);
 					}
+				}
+
+				if (
+					!worktreeLines.includes(workspacePath) &&
+					existsSync(workspacePath)
+				) {
+					throw new WorktreeFreshnessError(
+						`Cannot create expected worktree at ${workspacePath}: the path already exists but is not registered as a Git worktree. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, delete, or replace this directory automatically.`,
+					);
 				}
 			} catch (error) {
 				if (error instanceof WorktreeFreshnessError) {
 					throw error;
 				}
-				// git worktree command failed, continue with creation
+				throw new WorktreeFreshnessError(
+					`Cannot inspect Git worktrees before using ${workspacePath}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not create or reuse an unverified workspace.`,
+				);
 			}
 
 			// Check if branch already exists
