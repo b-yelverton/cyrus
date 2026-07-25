@@ -806,6 +806,185 @@ describe("GitService", () => {
 	});
 
 	describe("createGitWorktree - stale worktree detection", () => {
+		const existingWorktreePorcelain = [
+			"worktree /home/user/repo",
+			"HEAD abc123",
+			"branch refs/heads/main",
+			"",
+			"worktree /home/user/.cyrus/worktrees/ENG-97",
+			"HEAD oldbase",
+			"branch refs/heads/cyrustester/eng-97-fix-shader",
+			"",
+		].join("\n");
+
+		const makeExistingWorktreeValid = () => {
+			mockExistsSync.mockImplementation(
+				(path: any) =>
+					String(path) === "/home/user/.cyrus/worktrees/ENG-97/.git",
+			);
+			mockStatSync.mockReturnValue({ isFile: () => true } as any);
+		};
+
+		it("fetches and prunes before the shared runtime reuse path resets a clean stale worktree", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "newbase\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === "git status --porcelain") return "";
+				if (cmdStr === 'git rev-list --count "origin/main..HEAD"') {
+					return "0\n";
+				}
+				if (cmdStr === 'git reset --hard "origin/main"') {
+					return Buffer.from("");
+				}
+				return Buffer.from("");
+			});
+
+			const result = await gitService.createGitWorktree(issue, [repository]);
+
+			expect(result).toMatchObject({
+				path: "/home/user/.cyrus/worktrees/ENG-97",
+				isGitWorktree: true,
+			});
+			expect(mockExecSync).toHaveBeenCalledWith("git fetch origin --prune", {
+				cwd: "/home/user/repo",
+				stdio: "pipe",
+			});
+			expect(mockExecSync).toHaveBeenCalledWith(
+				'git reset --hard "origin/main"',
+				{
+					cwd: "/home/user/.cyrus/worktrees/ENG-97",
+					stdio: "pipe",
+				},
+			);
+			const commands = mockExecSync.mock.calls.map(([command]) =>
+				String(command),
+			);
+			expect(commands.indexOf("git fetch origin --prune")).toBeLessThan(
+				commands.indexOf("git worktree list --porcelain"),
+			);
+		});
+
+		it("keeps a current-base task worktree resumable through the public runtime path", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "base\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "task\n";
+				if (cmdStr === 'git merge-base "origin/main" HEAD') return "base\n";
+				return Buffer.from("");
+			});
+
+			const result = await gitService.createGitWorktree(issue, [repository]);
+
+			expect(result).toMatchObject({
+				path: "/home/user/.cyrus/worktrees/ENG-97",
+				isGitWorktree: true,
+			});
+			const commands = mockExecSync.mock.calls.map(([command]) =>
+				String(command),
+			);
+			expect(commands).not.toContain("git status --porcelain");
+			expect(commands).not.toContain('git reset --hard "origin/main"');
+		});
+
+		it("refuses a dirty stale worktree without resetting, stashing, rebasing, or deleting it", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "newbase\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === "git status --porcelain") return " M package.json\n";
+				if (cmdStr === 'git rev-list --count "origin/main..HEAD"') {
+					return "0\n";
+				}
+				return Buffer.from("");
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(/Manual resume, rebase, or relaunch is required/);
+			const commands = mockExecSync.mock.calls.map(([command]) =>
+				String(command),
+			);
+			expect(commands).not.toContain('git reset --hard "origin/main"');
+			expect(
+				commands.some((command) =>
+					/git (stash|rebase|worktree remove)/.test(command),
+				),
+			).toBe(false);
+		});
+
+		it("refuses a stale worktree with task commits without resetting, stashing, rebasing, or deleting it", async () => {
+			const issue = makeIssue();
+			const repository = makeRepository();
+			makeExistingWorktreeValid();
+
+			mockExecSync.mockImplementation((cmd: any) => {
+				const cmdStr = String(cmd);
+				if (cmdStr === "git rev-parse --git-dir") return Buffer.from(".git\n");
+				if (cmdStr === "git fetch origin --prune") return Buffer.from("");
+				if (cmdStr === "git worktree list --porcelain") {
+					return existingWorktreePorcelain;
+				}
+				if (cmdStr === 'git rev-parse --verify "origin/main"') {
+					return "newbase\n";
+				}
+				if (cmdStr === "git rev-parse --verify HEAD") return "oldbase\n";
+				if (cmdStr === "git status --porcelain") return "";
+				if (cmdStr === 'git rev-list --count "origin/main..HEAD"') {
+					return "2\n";
+				}
+				return Buffer.from("");
+			});
+
+			await expect(
+				gitService.createGitWorktree(issue, [repository]),
+			).rejects.toThrow(
+				/2 task commit\(s\).*Manual resume, rebase, or relaunch is required/,
+			);
+			const commands = mockExecSync.mock.calls.map(([command]) =>
+				String(command),
+			);
+			expect(commands).not.toContain('git reset --hard "origin/main"');
+			expect(
+				commands.some((command) =>
+					/git (stash|rebase|worktree remove)/.test(command),
+				),
+			).toBe(false);
+		});
+
 		it("prunes and recreates worktree when git lists it but directory has no .git file", async () => {
 			const issue = makeIssue();
 			const repository = makeRepository();

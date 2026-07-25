@@ -62,6 +62,18 @@ const HOOK_OUTPUT_TAIL_MAX_BYTES = 64 * 1024;
 const HOOK_OUTPUT_TAIL_MAX_CHARS = 8_000;
 const HOOK_OUTPUT_TAIL_MAX_LINES = 40;
 
+/**
+ * Raised when a pre-existing issue worktree cannot be safely brought forward
+ * to the freshly fetched remote base. Callers must surface this outcome rather
+ * than quietly creating a plain directory or mutating the user's worktree.
+ */
+export class WorktreeFreshnessError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "WorktreeFreshnessError";
+	}
+}
+
 type HookKind = "setup" | "teardown";
 
 interface HookScriptOptions {
@@ -371,6 +383,175 @@ export class GitService {
 	}
 
 	/**
+	 * Refresh remote-tracking refs before making a reuse decision. A reused
+	 * worktree must be judged against the current remote base, not a stale local
+	 * origin/<base> ref left over from an earlier Cyrus session.
+	 */
+	private refreshOrigin(repositoryPath: string): boolean {
+		this.logger.debug(
+			"Fetching and pruning origin before worktree reuse check...",
+		);
+		try {
+			execSync("git fetch origin --prune", {
+				cwd: repositoryPath,
+				stdio: "pipe",
+			});
+			return true;
+		} catch (error) {
+			this.logger.warn(
+				"Warning: git fetch failed, proceeding without remote branch creation:",
+				(error as Error).message,
+			);
+			return false;
+		}
+	}
+
+	/**
+	 * Reuse a valid worktree only after proving it is current with the freshly
+	 * fetched remote base, or after safely resetting a clean, no-task-commit
+	 * worktree to that base. Dirty worktrees and worktrees with task commits are
+	 * intentionally fail-closed: they require an explicit resume, rebase, or
+	 * relaunch decision outside this automatic path.
+	 */
+	private reuseFreshWorktree(
+		workspacePath: string,
+		repository: RepositoryConfig,
+		resolution: BaseBranchResolution,
+		hasRemote: boolean,
+	): Workspace {
+		const remoteBase = `origin/${resolution.branch}`;
+
+		if (!hasRemote) {
+			throw new WorktreeFreshnessError(
+				`Cannot reuse worktree at ${workspacePath}: origin could not be refreshed before checking ${remoteBase}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+			);
+		}
+
+		let remoteBaseSha: string;
+		let worktreeHeadSha: string;
+		try {
+			remoteBaseSha = String(
+				execSync(`git rev-parse --verify "${remoteBase}"`, {
+					cwd: repository.repositoryPath,
+					encoding: "utf-8",
+				}),
+			).trim();
+			worktreeHeadSha = String(
+				execSync("git rev-parse --verify HEAD", {
+					cwd: workspacePath,
+					encoding: "utf-8",
+				}),
+			).trim();
+		} catch (error) {
+			throw new WorktreeFreshnessError(
+				`Cannot verify freshness for worktree at ${workspacePath} against ${remoteBase}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+			);
+		}
+
+		if (worktreeHeadSha === remoteBaseSha) {
+			this.logger.info(
+				`Worktree already exists at ${workspacePath} and matches ${remoteBase}, using existing`,
+			);
+			return {
+				path: workspacePath,
+				isGitWorktree: true,
+				resolvedBaseBranches: { [repository.id]: resolution },
+			};
+		}
+
+		// A task branch normally differs from its base because it has task commits.
+		// That is safe to resume when the freshly fetched base is already an
+		// ancestor of HEAD; only a base that is not in the worktree history is
+		// stale for the purposes of this recovery path.
+		let commonAncestorSha: string;
+		try {
+			commonAncestorSha = String(
+				execSync(`git merge-base "${remoteBase}" HEAD`, {
+					cwd: workspacePath,
+					encoding: "utf-8",
+				}),
+			).trim();
+		} catch (error) {
+			throw new WorktreeFreshnessError(
+				`Cannot determine whether worktree at ${workspacePath} includes ${remoteBase}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+			);
+		}
+
+		if (commonAncestorSha === remoteBaseSha) {
+			this.logger.info(
+				`Worktree already exists at ${workspacePath} and includes ${remoteBase}, using existing`,
+			);
+			return {
+				path: workspacePath,
+				isGitWorktree: true,
+				resolvedBaseBranches: { [repository.id]: resolution },
+			};
+		}
+
+		let dirty: boolean;
+		let taskCommitCount: number;
+		try {
+			dirty =
+				String(
+					execSync("git status --porcelain", {
+						cwd: workspacePath,
+						encoding: "utf-8",
+					}),
+				).trim().length > 0;
+			taskCommitCount = Number.parseInt(
+				execSync(`git rev-list --count "${remoteBase}..HEAD"`, {
+					cwd: workspacePath,
+					encoding: "utf-8",
+				})
+					.toString()
+					.trim(),
+				10,
+			);
+			if (Number.isNaN(taskCommitCount)) {
+				throw new Error(
+					"git rev-list returned a non-numeric task commit count",
+				);
+			}
+		} catch (error) {
+			throw new WorktreeFreshnessError(
+				`Cannot determine whether stale worktree at ${workspacePath} is safe to reset: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+			);
+		}
+
+		if (dirty) {
+			throw new WorktreeFreshnessError(
+				`Worktree at ${workspacePath} has uncommitted changes and is behind ${remoteBase}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+			);
+		}
+
+		if (taskCommitCount > 0) {
+			throw new WorktreeFreshnessError(
+				`Worktree at ${workspacePath} has ${taskCommitCount} task commit(s) on a stale base behind ${remoteBase}. Manual resume, rebase, or relaunch is required; Cyrus will not reset, stash, or delete this worktree automatically.`,
+			);
+		}
+
+		this.logger.info(
+			`Resetting clean worktree at ${workspacePath} with no task commits to ${remoteBase}`,
+		);
+		try {
+			execSync(`git reset --hard "${remoteBase}"`, {
+				cwd: workspacePath,
+				stdio: "pipe",
+			});
+		} catch (error) {
+			throw new WorktreeFreshnessError(
+				`Unable to reset clean stale worktree at ${workspacePath} to ${remoteBase}: ${(error as Error).message}. Manual resume, rebase, or relaunch is required; Cyrus will not delete this worktree automatically.`,
+			);
+		}
+
+		return {
+			path: workspacePath,
+			isGitWorktree: true,
+			resolvedBaseBranches: { [repository.id]: resolution },
+		};
+	}
+
+	/**
 	 * Determine the base branch for an issue with full resolution info.
 	 *
 	 * Priority order:
@@ -665,6 +846,9 @@ export class GitService {
 					);
 				}
 			} catch (error) {
+				if (error instanceof WorktreeFreshnessError) {
+					throw error;
+				}
 				this.logger.error(
 					`Failed to create worktree for repo '${repository.name}': ${(error as Error).message}`,
 				);
@@ -709,6 +893,9 @@ export class GitService {
 				}
 			: { branch: repository.baseBranch, source: "default" };
 
+		let resolution = fallbackResolution;
+		let hasRemote = false;
+
 		try {
 			// Verify this is a git repository
 			try {
@@ -745,12 +932,17 @@ export class GitService {
 
 			// Determine base branch early (commit-ish > graphite > parent > default)
 			// This runs before worktree existence checks so all return paths have the resolution
-			const resolution = await this.determineBaseBranch(
+			resolution = await this.determineBaseBranch(
 				issue,
 				repository,
 				baseBranchOverride,
 			);
 			const baseBranch = resolution.branch;
+
+			// Always refresh and prune origin before considering an existing
+			// worktree. This keeps reuse decisions aligned with the configured
+			// remote base instead of a stale local remote-tracking ref.
+			hasRemote = this.refreshOrigin(repository.repositoryPath);
 
 			// Check if worktree already exists
 			try {
@@ -770,14 +962,12 @@ export class GitService {
 					// Verify the worktree is actually valid on disk (not a stale entry
 					// from a previous cleanup that deleted the directory)
 					if (this.isGitWorktree(workspacePath)) {
-						this.logger.info(
-							`Worktree already exists at ${workspacePath}, using existing`,
+						return this.reuseFreshWorktree(
+							workspacePath,
+							repository,
+							resolution,
+							hasRemote,
 						);
-						return {
-							path: workspacePath,
-							isGitWorktree: true,
-							resolvedBaseBranches: { [repository.id]: resolution },
-						};
 					}
 					// Stale worktree entry — prune and continue with creation
 					this.logger.info(
@@ -792,7 +982,10 @@ export class GitService {
 						// Prune failed, continue anyway
 					}
 				}
-			} catch (_e) {
+			} catch (error) {
+				if (error instanceof WorktreeFreshnessError) {
+					throw error;
+				}
 				// git worktree command failed, continue with creation
 			}
 
@@ -816,30 +1009,15 @@ export class GitService {
 				);
 				if (existingWorktreePath && existingWorktreePath !== workspacePath) {
 					this.logger.info(
-						`Branch "${branchName}" is already checked out in worktree at ${existingWorktreePath}, reusing existing worktree`,
+						`Branch "${branchName}" is already checked out in worktree at ${existingWorktreePath}; checking freshness before reuse`,
 					);
-					return {
-						path: existingWorktreePath,
-						isGitWorktree: true,
-						resolvedBaseBranches: { [repository.id]: resolution },
-					};
+					return this.reuseFreshWorktree(
+						existingWorktreePath,
+						repository,
+						resolution,
+						hasRemote,
+					);
 				}
-			}
-
-			// Fetch latest changes from remote
-			this.logger.debug("Fetching latest changes from remote...");
-			let hasRemote = true;
-			try {
-				execSync("git fetch origin", {
-					cwd: repository.repositoryPath,
-					stdio: "pipe",
-				});
-			} catch (e) {
-				this.logger.warn(
-					"Warning: git fetch failed, proceeding with local branch:",
-					(e as Error).message,
-				);
-				hasRemote = false;
 			}
 
 			// Create the worktree - use determined base branch
@@ -950,6 +1128,13 @@ export class GitService {
 				resolvedBaseBranches: { [repository.id]: resolution },
 			};
 		} catch (error) {
+			if (error instanceof WorktreeFreshnessError) {
+				this.logger.error(
+					"Existing worktree requires manual intervention:",
+					error.message,
+				);
+				throw error;
+			}
 			const errorMessage = (error as Error).message;
 			this.logger.error("Failed to create git worktree:", errorMessage);
 
@@ -960,13 +1145,14 @@ export class GitService {
 			);
 			if (worktreeMatch?.[1] && existsSync(worktreeMatch[1])) {
 				this.logger.info(
-					`Reusing existing worktree at ${worktreeMatch[1]} (branch already checked out)`,
+					`Reusing existing worktree at ${worktreeMatch[1]} after freshness check`,
 				);
-				return {
-					path: worktreeMatch[1],
-					isGitWorktree: true,
-					resolvedBaseBranches: { [repository.id]: fallbackResolution },
-				};
+				return this.reuseFreshWorktree(
+					worktreeMatch[1],
+					repository,
+					resolution,
+					hasRemote,
+				);
 			}
 
 			// Fall back to regular directory if git worktree fails
