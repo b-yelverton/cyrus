@@ -45,7 +45,7 @@
 		"file-type": "^21.3.2",
 		"ignore": "^7.0.5",
 		"node-forge": "^1.4.0",
-		"zod": "4.3.6"
+		"zod": "4.6.6"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
